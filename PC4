@@ -1,0 +1,130 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import sys
+import time
+from ctypes import *
+
+# --- dwf 라이브러리 로드 및 장치 핸들 설정 ---
+if sys.platform.startswith("win"):
+    dwf = cdll.dwf
+elif sys.platform.startswith("darwin"):
+    dwf = cdll.LoadLibrary("/Library/Frameworks/dwf.framework/dwf")
+else:
+    dwf = cdll.LoadLibrary("libdwf.so")
+hdwf = c_int()
+dwf.FDwfDeviceOpen(c_int(-1), byref(hdwf))
+# ---
+
+# ==============================================================================
+# 1. Experiment Conditions
+# ==============================================================================
+R_SENSE = 100.0  # Sense resistor value in Ohms
+
+# Voltage sweep range for the circuit input
+voltages_dc = np.linspace(-0.5, 3.0, 150)
+
+# --- Data storage lists ---
+diode_voltages = []
+diode_currents = []
+
+# --- DWF constants ---
+AnalogOutNodeCarrier = c_int(0)
+sts = c_byte()
+# ---
+
+# ==============================================================================
+# 2. Data Acquisition Loop
+# ==============================================================================
+print("Starting Diode V-I Curve Measurement...")
+
+# --- Configure AnalogIn (Oscilloscope) ---
+dwf.FDwfAnalogInChannelEnableSet(hdwf, c_int(0), c_bool(True))
+dwf.FDwfAnalogInChannelRangeSet(hdwf, c_int(0), c_double(5.0))
+dwf.FDwfAnalogInChannelEnableSet(hdwf, c_int(1), c_bool(True))
+dwf.FDwfAnalogInChannelRangeSet(hdwf, c_int(1), c_double(5.0))
+dwf.FDwfAnalogInFrequencySet(hdwf, c_double(100000.0))
+dwf.FDwfAnalogInAcquisitionModeSet(hdwf, c_int(1))
+dwf.FDwfAnalogInTriggerSourceSet(hdwf, c_ubyte(0))
+# ---
+
+# --- Configure AnalogOut (Wavegen) ---
+dwf.FDwfAnalogOutNodeEnableSet(hdwf, c_int(0), AnalogOutNodeCarrier, c_bool(True))
+dwf.FDwfAnalogOutNodeFunctionSet(hdwf, c_int(0), AnalogOutNodeCarrier, c_ubyte(0)) # funcDC
+# ---
+
+for v_in in tqdm(voltages_dc):
+    dwf.FDwfAnalogOutNodeOffsetSet(hdwf, c_int(0), AnalogOutNodeCarrier, c_double(v_in))
+    dwf.FDwfAnalogOutConfigure(hdwf, c_int(0), c_bool(True))
+    time.sleep(0.05)
+
+    v1_avg, v2_avg = c_double(), c_double()
+    dwf.FDwfAnalogInConfigure(hdwf, c_bool(True), c_bool(False))
+    
+    v1_samples, v2_samples = [], []
+    for _ in range(10):
+        dwf.FDwfAnalogInStatus(hdwf, c_int(1), byref(sts))
+        dwf.FDwfAnalogInStatusSample(hdwf, c_int(0), byref(v1_avg))
+        dwf.FDwfAnalogInStatusSample(hdwf, c_int(1), byref(v2_avg))
+        v1_samples.append(v1_avg.value)
+        v2_samples.append(v2_avg.value)
+        time.sleep(0.001)
+        
+    v1_measured, v2_measured = np.mean(v1_samples), np.mean(v2_samples)
+    
+    v_diode = v2_measured
+    v_resistor = v1_measured - v2_measured
+    i_circuit = v_resistor / R_SENSE
+    
+    diode_voltages.append(v_diode)
+    diode_currents.append(i_circuit)
+
+dwf.FDwfAnalogOutConfigure(hdwf, c_int(0), c_bool(False))
+print("Measurement complete.")
+dwf.FDwfDeviceCloseAll()
+
+# ==============================================================================
+# 3. Data Analysis & Threshold Voltage Calculation
+# ==============================================================================
+diode_voltages = np.array(diode_voltages)
+diode_currents = np.array(diode_currents)
+diode_currents_mA = diode_currents * 1000
+
+# Set threshold current to find the turn-on voltage
+threshold_current_mA = max(np.max(diode_currents_mA) * 0.01, 1.0)
+
+try:
+    threshold_index = np.where(diode_currents_mA > threshold_current_mA)[0][0]
+    v_threshold = diode_voltages[threshold_index]
+    found_threshold = True
+except (IndexError, ValueError):
+    v_threshold = 0
+    found_threshold = False
+
+# ==============================================================================
+# 4. Print Results & Plot Figure
+# ==============================================================================
+print(f"Sense Resistor (R_sense): {R_SENSE} Ohm")
+if found_threshold:
+    print(f"Calculated Threshold Voltage (V_th): {v_threshold:.3f} V (at {threshold_current_mA:.2f} mA)")
+else:
+    print("Could not determine Threshold Voltage (current did not rise sufficiently).")
+
+# Plotting the figure
+plt.figure(figsize=(10, 7))
+# Plot data as black dots ('ko') without a connecting line
+plt.plot(diode_voltages, diode_currents_mA, 'ko', label='Measured Data (1N4007)')
+
+if found_threshold:
+    # Add a vertical line for the threshold voltage
+    plt.axvline(v_threshold, color='r', linestyle='--', label=f'Threshold Voltage ≈ {v_threshold:.3f} V')
+
+# English labels and title
+plt.title('PN Diode V-I Characteristic Curve', fontsize=16)
+plt.xlabel('Diode Voltage (V)', fontsize=12)
+plt.ylabel('Diode Current (mA)', fontsize=12)
+plt.axhline(0, color='black', linewidth=0.5)
+plt.axvline(0, color='black', linewidth=0.5)
+plt.legend()
+# plt.grid(False) # Grid is off by default, this line is not strictly necessary
+plt.show()
